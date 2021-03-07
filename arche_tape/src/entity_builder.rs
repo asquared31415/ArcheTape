@@ -1,9 +1,9 @@
-use std::ptr::NonNull;
 use std::{
     alloc::{alloc, dealloc, handle_alloc_error, realloc, Layout},
     collections::HashMap,
-    mem::{ManuallyDrop, MaybeUninit},
+    mem::ManuallyDrop,
 };
+use std::{panic::catch_unwind, process::abort, ptr::NonNull};
 
 use crate::{
     world::{AddRemoveCache, Archetype, ComponentMeta},
@@ -195,7 +195,7 @@ impl<'a> EntityBuilder<'a> {
         let component_size = self
             .world
             .get_entity_meta(component_id)
-            .expect("Dead entity may not be used as a component")
+            .expect("Nonexistent or dead entities cannot be added")
             .component_meta
             .layout
             .size();
@@ -207,9 +207,9 @@ impl<'a> EntityBuilder<'a> {
         }
 
         unsafe {
-            std::ptr::copy_nonoverlapping::<MaybeUninit<u8>>(
-                component as *mut _,
-                self.data.as_ptr().offset(self.len as isize) as *mut _,
+            std::ptr::copy_nonoverlapping(
+                component,
+                self.data.as_ptr().offset(self.len as isize),
                 component_size,
             );
         }
@@ -352,5 +352,134 @@ impl<'a> EntityBuilder<'a> {
             component_storages,
             add_remove_cache: AddRemoveCache::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::entities::Entities;
+
+    use super::*;
+
+    #[test]
+    fn entity_builder_new() -> () {
+        let mut world = World::new();
+        let mut entities = Entities::new();
+        let entity = entities.spawn();
+
+        let builder = EntityBuilder::new(&mut world, entity, ComponentMeta::unit());
+
+        // TODO: assert worlds somehow?
+        assert_eq!(builder.entity, entity);
+        assert_eq!(builder.len, 0);
+        assert_eq!(builder.num_components, 0);
+        assert_eq!(builder.component_meta.layout, Layout::new::<()>());
+    }
+
+    #[test]
+    fn entity_builder_with_dynamic() -> () {
+        let mut world = World::new();
+        let comp_id = unsafe {
+            world
+                .spawn_with_component_meta(ComponentMeta::from_size_align(4, 4))
+                .build()
+        };
+        let mut builder = unsafe {
+            world
+                .spawn()
+                .with_dynamic_with_data(&mut 1337_u32 as *mut u32 as *mut u8, comp_id)
+        };
+
+        assert_eq!(builder.len, 4);
+        assert_eq!(builder.num_components, 1);
+        assert!(builder.comp_ids.contains(&comp_id));
+        assert_eq!(builder.comp_ids.len(), 1);
+        assert_eq!(builder.component_meta.layout, Layout::new::<()>());
+
+        let entity = builder.build();
+        drop(builder);
+
+        let data = world.get_component_mut_dynamic(entity, comp_id);
+        unsafe {
+            assert_eq!(*(data.unwrap() as *const u32), 1337_u32);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Nonexistent or dead entities cannot be added")]
+    fn entity_builder_with_dynamic_dead_component_id() -> () {
+        let mut world = World::new();
+        let comp_id = unsafe {
+            world
+                .spawn_with_component_meta(ComponentMeta::from_size_align(4, 4))
+                .build()
+        };
+        world.despawn(comp_id);
+
+        unsafe {
+            world
+                .spawn()
+                .with_dynamic_with_data(&mut 1337_u32 as *mut u32 as *mut u8, comp_id)
+                .build()
+        };
+    }
+
+    #[test]
+    fn entity_builder_with() -> () {
+        let mut world = World::new();
+        let mut builder = world.spawn().with(1337_u32);
+
+        assert_eq!(builder.len, 4);
+        assert_eq!(builder.num_components, 1);
+        assert_eq!(builder.comp_ids.len(), 1);
+
+        let entity = builder.build();
+        drop(builder);
+
+        let data = world.get_component_mut::<u32>(entity);
+        assert_eq!(data, Some(&mut 1337_u32));
+    }
+
+    #[test]
+    fn entity_builder_build() -> () {
+        let mut world = World::new();
+        let entity = world.spawn().build();
+
+        assert!(world.is_alive(entity));
+        assert_eq!(entity, EcsId::new(0, 0));
+    }
+}
+
+// probably panics a lot
+/// # Safety
+///
+/// * `builder` must be a valid pointer to an `EntityBuilder` created by one of the spawn methods on World
+#[no_mangle]
+pub unsafe extern "C" fn _entitybuilder_build(builder: *mut u8) -> EcsId {
+    match catch_unwind(|| unsafe { Box::from_raw(builder as *mut EntityBuilder) }.build()) {
+        Ok(entity) => entity,
+        Err(_) => abort(),
+    }
+}
+
+// probably panics a lot
+/// # Safety
+///
+/// * `builder` must be a valid pointer to an `EntityBuilder` created by one of the spawn methods on World
+/// * `component` must be a valid pointer to a component that matches the component meta on `component_id`
+#[no_mangle]
+pub unsafe extern "C" fn _entitybuilder_with_dynamic(
+    builder: *mut u8,
+    component: *mut u8,
+    component_id: EcsId,
+) -> *mut u8 {
+    match catch_unwind(|| unsafe {
+        let build = Box::from_raw(builder as *mut EntityBuilder);
+        Box::into_raw(Box::new(
+            build.with_dynamic_with_data(component, component_id),
+        )) as *mut u8
+    }) {
+        Ok(builder) => builder,
+        Err(_) => abort(),
     }
 }

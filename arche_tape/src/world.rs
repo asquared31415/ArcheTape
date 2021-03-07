@@ -6,10 +6,12 @@ use crate::{
     static_query::StaticQuery,
     Component,
 };
-use std::cell::UnsafeCell;
+use std::{cell::UnsafeCell, ptr};
 use std::collections::HashMap;
+use std::panic::catch_unwind;
+use std::process::abort;
 use std::sync::RwLock;
-use std::{any::TypeId, slice::Iter};
+use std::{any::TypeId, borrow::BorrowMut, panic::AssertUnwindSafe, slice::Iter};
 use untyped_vec::UntypedVec;
 
 pub struct ArchetypeIter<'a, const N: usize> {
@@ -229,7 +231,7 @@ pub struct ComponentMeta {
     pub layout: core::alloc::Layout,
 }
 
-fn component_meta_drop_fn<T: Component>(ptr: *mut core::mem::MaybeUninit<u8>) {
+fn component_meta_drop_fn<T: 'static>(ptr: *mut core::mem::MaybeUninit<u8>) {
     unsafe { core::ptr::drop_in_place::<T>(ptr as *mut T) }
 }
 
@@ -356,7 +358,7 @@ impl World {
         true
     }
 
-    pub fn is_alive(&self, entity: EcsId) -> bool {
+    pub fn is_alive(&mut self, entity: EcsId) -> bool {
         self.entities.is_alive(entity)
     }
 
@@ -431,10 +433,10 @@ impl World {
 }
 
 impl World {
-    #[must_use]
     /// # Safety
     ///
     ///    All subsequent uses of this entity as a component must be valid for the given ComponentMeta
+    #[must_use]
     pub unsafe fn spawn_with_component_meta(
         &mut self,
         component_meta: ComponentMeta,
@@ -882,5 +884,476 @@ impl World {
                 .get_mut_raw(entity_idx)
                 .unwrap(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spawn;
+
+    #[test]
+    pub fn spawn() -> () {
+        let mut world = World::new();
+        let _ = world.spawn();
+    }
+
+    #[test]
+    pub fn get() {
+        let mut world = World::new();
+
+        let entity = spawn!(&mut world, 10_u32, 12_u64, "Hello");
+        let entity2 = spawn!(&mut world, 18_u32, "AWDAWDAWD", 16.0f32);
+
+        let str_comp: &mut &str = world.get_component_mut(entity).unwrap();
+        assert!(*str_comp == "Hello");
+
+        let str_comp: &mut &str = world.get_component_mut(entity2).unwrap();
+        assert!(*str_comp == "AWDAWDAWD");
+    }
+
+    #[test]
+    pub fn entity_archetype_lookup() {
+        let mut world = World::new();
+
+        let entity = spawn!(&mut world, 10_u32, 12_u64);
+
+        let entity_meta = world.ecs_id_meta[entity.uindex()].clone().unwrap();
+        assert!(entity_meta.instance_meta.index == 0);
+        assert!(entity_meta.instance_meta.archetype.0 == 1);
+    }
+
+    #[test]
+    pub fn add_component() {
+        let mut world = World::new();
+        let entity = spawn!(&mut world, 1_u32);
+        world.add_component(entity, 2_u64);
+
+        assert!(world.archetypes.len() == 3);
+        let entity_meta = world.ecs_id_meta[entity.uindex()].clone().unwrap();
+        assert!(entity_meta.instance_meta.archetype.0 == 2);
+        assert!(entity_meta.instance_meta.index == 0);
+
+        // The two component entities
+        assert!(world.archetypes[0].entities.len() == 2);
+        assert!(world.archetypes[0].component_storages.len() == 0);
+        for (_, lock) in world.archetypes[0].component_storages.iter_mut() {
+            let storage = lock.get_mut();
+            assert!(storage.len() == 0);
+        }
+
+        // The first archetype entity was in
+        assert!(world.archetypes[1].entities.len() == 0);
+        assert!(world.archetypes[1].component_storages.len() == 1);
+        for (_, lock) in world.archetypes[1].component_storages.iter_mut() {
+            let storage = lock.get_mut();
+            assert!(storage.len() == 0);
+        }
+
+        // The current archetype entity was in
+        assert!(world.archetypes[2].entities.len() == 1);
+        assert!(world.archetypes[2].component_storages.len() == 2);
+        for (_, lock) in world.archetypes[2].component_storages.iter_mut() {
+            let storage = lock.get_mut();
+            assert!(storage.len() == 1);
+        }
+
+        let mut run_times = 0;
+        let mut query = world.query::<(&u32, &u64)>();
+        query.iter().for_each(|(left, right)| {
+            assert!(*left == 1);
+            assert!(*right == 2);
+            run_times += 1;
+        });
+        assert!(run_times == 1);
+    }
+
+    #[test]
+    pub fn add_component_then_spawn() {
+        let mut world = World::new();
+        let entity = spawn!(&mut world, 1_u32);
+        world.add_component(entity, 2_u64);
+
+        let entity2 = spawn!(&mut world, 3_u32, 4_u64);
+
+        assert!(world.archetypes.len() == 3);
+
+        // Component entities
+        assert!(world.archetypes[0].entities.len() == 2);
+        assert!(world.archetypes[0].component_storages.len() == 0);
+
+        // Original first entity archetype
+        assert!(world.archetypes[1].entities.len() == 0);
+        assert!(world.archetypes[1].component_storages.len() == 1);
+        assert!(world.archetypes[1].component_storages[0].1.get_mut().len() == 0);
+
+        // Entity2 + Entity1 Archetpye
+        assert!(world.archetypes[2].entities.len() == 2);
+        assert!(world.archetypes[2].entities[0] == entity);
+        assert!(world.archetypes[2].entities[1] == entity2);
+        assert!(world.archetypes[2].component_storages.len() == 2);
+        assert!(world.archetypes[2].component_storages[0].1.get_mut().len() == 2);
+        assert!(world.archetypes[2].component_storages[1].1.get_mut().len() == 2);
+
+        let entity_meta = world.ecs_id_meta[entity.uindex()].clone().unwrap();
+        assert!(entity_meta.instance_meta.archetype.0 == 2);
+        assert!(entity_meta.instance_meta.index == 0);
+
+        let entity_meta = world.ecs_id_meta[entity2.uindex()].clone().unwrap();
+        assert!(entity_meta.instance_meta.archetype.0 == 2);
+        assert!(entity_meta.instance_meta.index == 1);
+
+        let mut run_times = 0;
+        let mut checks = vec![(1, 2), (3, 4)].into_iter();
+        let mut query = world.query::<(&u32, &u64)>();
+        query.iter().for_each(|(left, right)| {
+            assert!(checks.next().unwrap() == (*left, *right));
+            run_times += 1;
+        });
+        assert!(run_times == 2);
+    }
+
+    #[test]
+    pub fn add_two() {
+        struct A(f32);
+        struct B(f32);
+
+        let mut world = World::new();
+        let entity_1 = spawn!(&mut world, A(1.));
+        let entity_2 = spawn!(&mut world, A(1.));
+
+        assert!(world.archetypes[0].entities.len() == 1);
+        assert!(world.archetypes[0].component_storages.len() == 0);
+
+        let entity_1_meta = world.ecs_id_meta[entity_1.uindex()].clone().unwrap();
+        assert!(world.archetypes[1].entities[0] == entity_1);
+        assert!(entity_1_meta.instance_meta.archetype.0 == 1);
+        assert!(entity_1_meta.instance_meta.index == 0);
+
+        let entity_2_meta = world.ecs_id_meta[entity_2.uindex()].clone().unwrap();
+        assert!(world.archetypes[1].entities[1] == entity_2);
+        assert!(entity_2_meta.instance_meta.archetype.0 == 1);
+        assert!(entity_2_meta.instance_meta.index == 1);
+
+        world.add_component(entity_1, B(2.));
+        assert!(world.archetypes[0].entities.len() == 2);
+
+        assert!(world.archetypes[1].entities[0] == entity_2);
+        assert!(world.archetypes[1].entities.len() == 1);
+        assert!(world.archetypes[2].entities[0] == entity_1);
+        assert!(world.archetypes[2].entities.len() == 1);
+
+        let entity_1_meta = world.ecs_id_meta[entity_1.uindex()].clone().unwrap();
+        assert!(entity_1_meta.instance_meta.archetype.0 == 2);
+        assert!(entity_1_meta.instance_meta.index == 0);
+
+        let entity_2_meta = world.ecs_id_meta[entity_2.uindex()].clone().unwrap();
+        assert!(entity_2_meta.instance_meta.archetype.0 == 1);
+        assert!(entity_2_meta.instance_meta.index == 0);
+
+        world.add_component(entity_2, B(2.));
+        assert!(world.archetypes[0].entities.len() == 2);
+        assert!(world.archetypes[1].entities.len() == 0);
+        assert!(world.archetypes[2].entities.len() == 2);
+
+        assert!(world.archetypes[2].entities[0] == entity_1);
+        assert!(world.archetypes[2].entities[1] == entity_2);
+
+        let entity_1_meta = world.ecs_id_meta[entity_1.uindex()].clone().unwrap();
+        assert!(entity_1_meta.instance_meta.archetype.0 == 2);
+        assert!(entity_1_meta.instance_meta.index == 0);
+
+        let entity_2_meta = world.ecs_id_meta[entity_2.uindex()].clone().unwrap();
+        assert!(entity_2_meta.instance_meta.archetype.0 == 2);
+        assert!(entity_2_meta.instance_meta.index == 1);
+    }
+
+    #[test]
+    pub fn add_multiple() {
+        struct A(f32);
+        struct B(f32);
+
+        let mut world = World::new();
+        let mut entities = Vec::with_capacity(500);
+
+        for _ in 0..10 {
+            entities.push(spawn!(&mut world, A(1.)));
+        }
+
+        for &entity in entities.iter() {
+            world.add_component(entity, B(1.));
+        }
+        for &entity in entities.iter() {
+            world.remove_component::<B>(entity);
+        }
+    }
+
+    #[test]
+    pub fn despawn_meta_update() {
+        let mut world = World::new();
+
+        let e1 = world.spawn().with(10_u32).build();
+        let e2 = world.spawn().with(12_u32).build();
+        let e3 = world.spawn().with(14_u32).build();
+
+        assert!(world.despawn(e1));
+
+        assert!(world.is_alive(e1) == false);
+        assert!(world.ecs_id_meta[e1.uindex()].is_none());
+
+        assert!(world.is_alive(e2));
+        assert!(world.is_alive(e3));
+
+        assert!(*world.get_component_mut::<u32>(e2).unwrap() == 12);
+        assert!(*world.get_component_mut::<u32>(e3).unwrap() == 14);
+    }
+
+    #[test]
+    pub fn despawn_component_entity() {
+        // TODO: Removing entities when they despawn not yet implemented
+        return;
+        let mut world = World::new();
+
+        unsafe {
+            let component_entity = world
+                .spawn_with_component_meta(ComponentMeta::from_generic::<u32>())
+                .build();
+
+            let e1 = world
+                .spawn()
+                .with_dynamic_with_data(&mut 10_u32 as *mut _ as *mut _, component_entity)
+                .build();
+            let e2 = world
+                .spawn()
+                .with_dynamic_with_data(&mut 10_u32 as *mut _ as *mut _, component_entity)
+                .build();
+            let e3 = world
+                .spawn()
+                .with_dynamic_with_data(&mut 10_u32 as *mut _ as *mut _, component_entity)
+                .build();
+
+            world.despawn(component_entity);
+
+            assert!(world.archetypes.len() == 2);
+
+            let assert_meta = |world: &mut World, entity: EcsId, archetype_idx, entity_idx| {
+                let meta = world.ecs_id_meta[entity.uindex()].as_ref().unwrap();
+                assert!(meta.instance_meta.archetype.0 == archetype_idx);
+                assert!(meta.instance_meta.index == entity_idx);
+            };
+
+            assert!(world.archetypes[0].entities == &[e1, e2, e3]);
+            assert_meta(&mut world, e1, 0, 0);
+            assert_meta(&mut world, e2, 0, 1);
+            assert_meta(&mut world, e3, 0, 2);
+
+            assert!(world.archetypes[1].entities.len() == 0);
+            assert!(world.ecs_id_meta[component_entity.uindex()].is_none());
+        }
+    }
+
+    // TODO: Boxy can you make the following tests actually work?
+    // Currently they basically just want to not panic, but they should check capacity if possible
+    #[test]
+    pub fn spawn_with_capacity() -> () {
+        let mut world = World::new();
+        let entity = world.spawn_with_capacity(32).build();
+        assert_eq!(entity, EcsId::new(0, 0));
+    }
+
+    #[test]
+    pub fn spawn_with_capacity_zero() -> () {
+        let mut world = World::new();
+        let entity = world.spawn_with_capacity(0).build();
+        assert_eq!(entity, EcsId::new(0, 0));
+    }
+
+    #[test]
+    pub fn test_alive() -> () {
+        let mut world = World::new();
+        let alive = world.spawn().build();
+        let dead = world.spawn().build();
+
+        world.despawn(dead);
+
+        assert!(world.is_alive(alive));
+        assert!(!world.is_alive(dead));
+    }
+}
+
+// ComponentMeta::from_size_align can panic when the requirements for Layout::from_size_align are not met
+#[no_mangle]
+pub extern "C" fn _component_meta_from_size_align(size: usize, align: usize) -> Box<ComponentMeta> {
+    match catch_unwind(|| Box::new(ComponentMeta::from_size_align(size, align))) {
+        Ok(meta) => meta,
+        Err(_) => abort(),
+    }
+}
+
+// Cannot panic, no need for catch_unwind
+#[no_mangle]
+pub extern "C" fn _component_meta_unit() -> Box<ComponentMeta> {
+    Box::new(ComponentMeta::unit())
+}
+
+// Cannot panic, no need for catch_unwind
+#[no_mangle]
+pub extern "C" fn _world_new() -> Box<World> {
+    Box::new(World::new())
+}
+
+// Cannot panic, no need for catch_unwind
+/// # Safety
+///
+/// * `_world` must be a valid pointer to a `World` created by `_world_new()`
+#[no_mangle]
+pub unsafe extern "C" fn _world_drop(_world: Option<Box<World>>) -> () {}
+
+// Possible, but unlikely, to panic in Entities::spawn or EntityBuilder::new through World::spawn
+/// # Safety
+///
+/// * `world` must be a valid pointer to a `World` created by `_world_new()`
+#[no_mangle]
+pub unsafe extern "C" fn _world_spawn(world: &mut World) -> *mut u8 {
+    // AssertUnwindSafe used because World is not unwind safe
+    // However, since the panic case is handled with an abort, it is fine
+    match catch_unwind(AssertUnwindSafe(|| {
+        Box::into_raw(Box::new(world.spawn())) as *mut u8
+    })) {
+        Ok(entity) => entity,
+        Err(_) => abort(),
+    }
+}
+
+// Possible, but unlikely, to panic in Entities::spawn or EntityBuilder::new through World::spawn_with_component_meta
+/// # Safety
+///
+/// * `world` must be a valid pointer to a `World` created by `_world_new()`
+/// * `component_meta` must be a valid pointer to a `ComponentMeta`
+#[no_mangle]
+pub unsafe extern "C" fn _world_spawn_with_component_meta(
+    world: &mut World,
+    component_meta: &mut ComponentMeta,
+) -> *mut u8 {
+    // AssertUnwindSafe used because World is not unwind safe
+    // However, since the panic case is handled with an abort, it is fine
+    match catch_unwind(AssertUnwindSafe(|| unsafe {
+        let builder = world.spawn_with_component_meta(component_meta.clone());
+        Box::into_raw(Box::new(builder)) as *mut u8
+    })) {
+        Ok(builder) => builder,
+        Err(_) => abort(),
+    }
+}
+
+// Could panic in lots of ways
+/// # Safety
+///
+/// * `world` must be a valid pointer to a `World` created by `_world_new()`
+#[no_mangle]
+pub extern "C" fn _world_despawn(world: &mut World, entity: EcsId) -> bool {
+    // AssertUnwindSafe used because World is not unwind safe
+    // However, since the panic case is handled with an abort, it is fine
+    match catch_unwind(AssertUnwindSafe(|| world.despawn(entity))) {
+        Ok(success) => success,
+        Err(_) => abort(),
+    }
+}
+
+// TODO: this really shouldn't panic, but it can
+/// # Safety
+///
+/// * `world` must be a valid pointer to a `World` created by `_world_new()`
+#[no_mangle]
+pub extern "C" fn _world_is_alive(world: &mut World, entity: EcsId) -> bool {
+    // AssertUnwindSafe used because World is not unwind safe
+    // However, since the panic case is handled with an abort, it is fine
+    match catch_unwind(AssertUnwindSafe(|| world.is_alive(entity))) {
+        Ok(success) => success,
+        Err(_) => abort(),
+    }
+}
+
+// probably panics a lot
+/// # Safety
+///
+/// * `world` must be a valid pointer to a `World` created by `_world_new()`
+#[no_mangle]
+pub unsafe extern "C" fn _world_add_component_dynamic(
+    world: &mut World,
+    entity: EcsId,
+    component_id: EcsId,
+) -> () {
+    // AssertUnwindSafe used because World is not unwind safe
+    // However, since the panic case is handled with an abort, it is fine
+    match catch_unwind(AssertUnwindSafe(|| {
+        world.add_component_dynamic(entity, component_id)
+    })) {
+        Ok(_) => {}
+        Err(_) => abort(),
+    }
+}
+
+// probably panics a lot
+/// # Safety
+///
+/// * `world` must be a valid pointer to a `World` created by `_world_new()`
+/// * `component_ptr` must be a valid pointer to data that matches the component meta on the entity `comp_id`
+#[no_mangle]
+pub unsafe extern "C" fn _world_add_component_dynamic_with_data(
+    world: &mut World,
+    entity: EcsId,
+    comp_id: EcsId,
+    component_ptr: *mut u8,
+) -> () {
+    // AssertUnwindSafe used because World is not unwind safe
+    // However, since the panic case is handled with an abort, it is fine
+    match catch_unwind(AssertUnwindSafe(|| unsafe {
+        world.add_component_dynamic_with_data(entity, comp_id, component_ptr);
+    })) {
+        Ok(_) => {}
+        Err(_) => abort(),
+    }
+}
+
+// probably panics a lot
+/// # Safety
+///
+/// * `world` must be a valid pointer to a `World` created by `_world_new()`
+#[no_mangle]
+pub unsafe extern "C" fn _world_remove_component_dynamic(
+    world: &mut World,
+    entity: EcsId,
+    comp_id: EcsId,
+) -> () {
+    // AssertUnwindSafe used because World is not unwind safe
+    // However, since the panic case is handled with an abort, it is fine
+    match catch_unwind(AssertUnwindSafe(|| {
+        world.remove_component_dynamic(entity, comp_id);
+    })) {
+        Ok(_) => {}
+        Err(_) => abort(),
+    }
+}
+
+// probably panics a lot
+/// # Safety
+///
+/// * `world` must be a valid pointer to a `World` created by `_world_new()`
+#[no_mangle]
+pub unsafe extern "C" fn _world_get_component_mut_dynamic(
+    world: &mut World,
+    entity: EcsId,
+    comp_id: EcsId,
+) -> *mut u8 {
+    // AssertUnwindSafe used because World is not unwind safe
+    // However, since the panic case is handled with an abort, it is fine
+    match catch_unwind(AssertUnwindSafe(|| {
+        world
+            .get_component_mut_dynamic(entity, comp_id)
+            .unwrap_or(ptr::null_mut())
+    })) {
+        Ok(component) => component,
+        Err(_) => abort(),
     }
 }

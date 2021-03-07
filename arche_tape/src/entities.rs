@@ -1,5 +1,8 @@
+#[repr(transparent)]
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct EcsIdGen(u32);
+
+#[repr(transparent)]
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct EcsIdIndex(u32);
 
@@ -27,6 +30,7 @@ impl std::fmt::Display for EcsIdIndex {
     }
 }
 
+#[repr(C)]
 #[derive(Copy, Clone, Debug, Ord, PartialOrd)]
 pub struct EcsId(EcsIdGen, EcsIdIndex);
 

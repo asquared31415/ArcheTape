@@ -16,6 +16,8 @@ macro_rules! spawn {
 
 mod bitset_iterator;
 
+mod ffi_tests;
+
 pub mod entities;
 pub mod entity_builder;
 pub mod world;
