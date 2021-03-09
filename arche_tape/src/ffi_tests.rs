@@ -5,7 +5,7 @@ mod ffi_tests {
 
         #[test]
         fn world_new() -> () {
-            let ptr = world::_world_new();
+            let _ptr = world::_world_new();
         }
 
         #[test]
@@ -75,6 +75,85 @@ mod ffi_tests {
 
             world::_world_despawn(world.as_mut(), entity);
             assert!(!world::_world_is_alive(world.as_mut(), entity));
+        }
+    }
+
+    mod dyn_query {
+        use crate::{
+            dyn_query::*,
+            entity_builder::*,
+            world::*,
+        };
+        use core::slice;
+
+        #[test]
+        fn dyn_query() {
+            let mut world = _world_new();
+
+            let u32_id = unsafe {
+                _entitybuilder_build(_world_spawn_with_component_meta(
+                    &mut world,
+                    &mut _component_meta_from_size_align(4, 4),
+                ))
+            };
+
+            let i32_id = unsafe {
+                _entitybuilder_build(_world_spawn_with_component_meta(
+                    &mut world,
+                    &mut _component_meta_from_size_align(4, 4),
+                ))
+            };
+
+            let _entity = unsafe {
+                _entitybuilder_build(_entitybuilder_with_dynamic(
+                    _entitybuilder_with_dynamic(
+                        _world_spawn(&mut world),
+                        &mut 1u32 as *mut u32 as *mut u8,
+                        u32_id,
+                    ),
+                    &mut -2 as *mut i32 as *mut u8,
+                    i32_id,
+                ))
+            };
+
+            let _entity2 = unsafe {
+                _entitybuilder_build(_entitybuilder_with_dynamic(
+                    _world_spawn(&mut world),
+                    &mut 2u32 as *mut u32 as *mut u8,
+                    u32_id,
+                ))
+            };
+
+            let _entity3 = unsafe {
+                _entitybuilder_build(_entitybuilder_with_dynamic(
+                    _entitybuilder_with_dynamic(
+                        _world_spawn(&mut world),
+                        &mut 999u32 as *mut u32 as *mut u8,
+                        u32_id,
+                    ),
+                    &mut -2048 as *mut i32 as *mut u8,
+                    i32_id,
+                ))
+            };
+
+            let fetches = [FetchType::Immut(u32_id), FetchType::Immut(i32_id)];
+            unsafe {
+                let query = _dyn_query_new(&mut world, fetches.as_ptr(), fetches.len());
+                let iter = _dyn_query_iter(query);
+                let FFIDynQueryResult { ptr, len } = _dyn_query_next(iter);
+                let data = slice::from_raw_parts(ptr as *mut PtrLen, len);
+
+                let mut collected = [(0u32, 0i32); 2];
+                for i in 0..data[0].1 {
+                    collected[i].0 = *(data[0].0.offset((4 * i) as isize) as *mut u32);
+                }
+
+                for i in 0..data[1].1 {
+                    collected[i].1 = *(data[1].0.offset((4 * i) as isize) as *mut i32);
+                }
+
+                assert_eq!(collected, [(1, -2), (999, -2048)]);
+            }
         }
     }
 }

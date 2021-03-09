@@ -1,6 +1,6 @@
 use crate::utils::EitherGuard;
 use crate::{world::Archetype, EcsId, World};
-use std::marker::PhantomData;
+use std::{convert::TryInto, marker::PhantomData, mem, ptr};
 
 struct IntraArchetypeIter<'a, const N: usize> {
     remaining: usize,
@@ -52,8 +52,8 @@ impl<'a, const N: usize> Iterator for IntraArchetypeIter<'a, N> {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone)]
-pub struct PtrLen(*mut u8, usize);
+#[derive(Copy, Clone, Debug)]
+pub struct PtrLen(pub *mut u8, pub usize);
 
 pub struct DynQueryColumnIter<'a, const N: usize> {
     comp_ids: [Option<EcsId>; N],
@@ -108,6 +108,9 @@ impl<'a, const N: usize> Iterator for DynQueryIter<'a, N> {
     }
 }
 
+// FFI compatible C interface using a union and a u8 tag
+#[repr(u8)]
+#[derive(Copy, Clone, Debug)]
 pub enum FetchType {
     EcsId,
     Mut(EcsId),
@@ -207,7 +210,6 @@ impl<'a, const N: usize> DynQuery<'a, N> {
             let bit_length = 0;
             let neg_fn: fn(_) -> _ = |x: usize| !x;
 
-            use std::convert::TryInto;
             let iters: Box<[_; N]> = vec![(self.world.entities_bitvec.data.iter(), neg_fn); N]
                 .into_boxed_slice()
                 .try_into()
@@ -233,7 +235,6 @@ impl<'a, const N: usize> DynQuery<'a, N> {
                     }
                 })
                 .collect::<Box<[_]>>();
-            use std::convert::TryInto;
             let iters: Box<[_; N]> = boxed_iters.try_into().unwrap();
             let iters = *iters;
 
@@ -266,7 +267,6 @@ impl<'a, const N: usize> DynQuery<'a, N> {
             let bit_length = 0;
             let neg_fn: fn(_) -> _ = |x: usize| !x;
 
-            use std::convert::TryInto;
             let iters: Box<[_; N]> = vec![(self.world.entities_bitvec.data.iter(), neg_fn); N]
                 .into_boxed_slice()
                 .try_into()
@@ -292,7 +292,7 @@ impl<'a, const N: usize> DynQuery<'a, N> {
                     }
                 })
                 .collect::<Box<[_]>>();
-            use std::convert::TryInto;
+
             let iters: Box<[_; N]> = boxed_iters.try_into().unwrap();
             let iters = *iters;
 
@@ -307,3 +307,98 @@ impl<'a, const N: usize> DynQuery<'a, N> {
         }
     }
 }
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct FFIDynQuery {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
+fn _query_dynamic<const N: usize>(world: &World, fetches: [FetchType; N]) -> FFIDynQuery {
+    let ptr = Box::into_raw(Box::new(DynQuery::new(world, fetches))) as *mut u8;
+    FFIDynQuery { ptr, len: N }
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FFIDynQueryIter {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
+fn __dyn_query_iter<const N: usize>(ptr: *mut u8) -> FFIDynQueryIter {
+    let mut query = unsafe { Box::from_raw(ptr as *mut DynQuery<N>) };
+    let ptr = Box::into_raw(Box::new(query.column_iter())) as *mut u8;
+    mem::forget(query);
+    FFIDynQueryIter { ptr, len: N }
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FFIDynQueryResult {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
+fn __dyn_query_next<const N: usize>(ptr: *mut u8) -> FFIDynQueryResult {
+    let mut iter = unsafe { Box::from_raw(ptr as *mut DynQueryColumnIter<N>) };
+    let ret = if let Some(a) = iter.next() {
+        FFIDynQueryResult {
+            ptr: Box::into_raw(Box::new(a)) as *mut u8,
+            len: N,
+        }
+    } else {
+        FFIDynQueryResult {
+            ptr: ptr::null_mut(),
+            len: 0,
+        }
+    };
+    mem::forget(iter);
+    ret
+}
+
+macro_rules! impl_ffi_dyn_query {
+    ($($N:literal)*) => {
+        #[no_mangle]
+        pub unsafe extern "C" fn _dyn_query_new(
+            world: &World,
+            fetches: *const FetchType,
+            len: usize,
+        ) -> FFIDynQuery {
+            unsafe {
+                match len {
+                    $(
+                        $N => _query_dynamic::<$N>(
+                            world,
+                            std::slice::from_raw_parts(fetches, $N).try_into().unwrap(),
+                        ),
+                    )*
+                    _ => unimplemented!("Dynamic queries over FFI for {} fetches are not implemented.", len),
+                }
+            }
+        }
+
+        #[no_mangle]
+        pub unsafe extern "C" fn _dyn_query_iter(q: FFIDynQuery) -> FFIDynQueryIter {
+            match q.len {
+                $(
+                    $N => __dyn_query_iter::<$N>(q.ptr),
+                )*
+                _ => unimplemented!("Dynamic queries over FFI for {} fetches are not implemented.", q.len),
+            }
+        }
+        
+        #[no_mangle]
+        pub unsafe extern "C" fn _dyn_query_next(qi: FFIDynQueryIter) -> FFIDynQueryResult {
+            match qi.len {
+                $(
+                    $N => __dyn_query_next::<$N>(qi.ptr),
+                )*
+                _ => unimplemented!("Dynamic queries over FFI for {} fetches are not implemented.", qi.len),
+            }
+        }
+    };
+}
+
+impl_ffi_dyn_query!(1 2 3 4 5 6 7 8);

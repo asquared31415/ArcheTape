@@ -6,12 +6,16 @@ use crate::{
     static_query::StaticQuery,
     Component,
 };
-use std::{cell::UnsafeCell, ptr};
-use std::collections::HashMap;
-use std::panic::catch_unwind;
-use std::process::abort;
-use std::sync::RwLock;
-use std::{any::TypeId, borrow::BorrowMut, panic::AssertUnwindSafe, slice::Iter};
+use std::{
+    any::TypeId,
+    cell::UnsafeCell,
+    collections::HashMap,
+    panic::{catch_unwind, AssertUnwindSafe},
+    process::abort,
+    ptr,
+    slice::Iter,
+    sync::RwLock,
+};
 use untyped_vec::UntypedVec;
 
 pub struct ArchetypeIter<'a, const N: usize> {
@@ -231,7 +235,7 @@ pub struct ComponentMeta {
     pub layout: core::alloc::Layout,
 }
 
-fn component_meta_drop_fn<T: 'static>(ptr: *mut core::mem::MaybeUninit<u8>) {
+fn component_meta_drop_fn<T: Component>(ptr: *mut core::mem::MaybeUninit<u8>) {
     unsafe { core::ptr::drop_in_place::<T>(ptr as *mut T) }
 }
 

@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections;
 using System.Runtime.InteropServices;
 
 namespace ArcheTapeFFI
@@ -26,58 +27,58 @@ namespace ArcheTapeFFI
 
     public class World
     {
-        private readonly IntPtr ptr;
+        public IntPtr Ptr { get; }
 
         public World()
         {
-            ptr = _world_new();
+            Ptr = _world_new();
         }
 
         ~World()
         {
-            _world_drop(ptr);
+            _world_drop(Ptr);
         }
 
         public EntityBuilder Spawn()
         {
-            var builder = _world_spawn(ptr);
+            var builder = _world_spawn(Ptr);
             return new EntityBuilder(builder);
         }
 
         public EntityBuilder SpawnWithComponentMeta(ComponentMeta meta)
         {
-            var builder = _world_spawn_with_component_meta(ptr, meta.Ptr);
+            var builder = _world_spawn_with_component_meta(Ptr, meta.Ptr);
             return new EntityBuilder(builder);
         }
 
         public void Despawn(EcsId entity)
         {
-            _world_despawn(ptr, entity);
+            _world_despawn(Ptr, entity);
         }
 
         public bool IsAlive(EcsId entity)
         {
-            return _world_is_alive(ptr, entity);
+            return _world_is_alive(Ptr, entity);
         }
 
         public void AddComponentDynamic(EcsId entity, EcsId componentId)
         {
-            _world_add_component_dynamic(ptr, entity, componentId);
+            _world_add_component_dynamic(Ptr, entity, componentId);
         }
 
         public unsafe void AddComponentDynamicWithData(EcsId entity, EcsId componentId, void* data)
         {
-            _world_add_component_dynamic_with_data(ptr, entity, componentId, data);
+            _world_add_component_dynamic_with_data(Ptr, entity, componentId, data);
         }
 
         public void RemoveComponentDynamic(EcsId entity, EcsId componentId)
         {
-            _world_remove_component_dynamic(ptr, entity, componentId);
+            _world_remove_component_dynamic(Ptr, entity, componentId);
         }
 
         public IntPtr GetComponentDynamic(EcsId entity, EcsId componentId)
         {
-            return _world_get_component_mut_dynamic(ptr, entity, componentId);
+            return _world_get_component_mut_dynamic(Ptr, entity, componentId);
         }
 
         [DllImport(Name.LibName)]
@@ -118,7 +119,7 @@ namespace ArcheTapeFFI
 
     public class EntityBuilder
     {
-        private readonly IntPtr ptr;
+        private IntPtr ptr;
 
         internal EntityBuilder(IntPtr ptr)
         {
@@ -130,8 +131,17 @@ namespace ArcheTapeFFI
             return _entitybuilder_build(ptr);
         }
 
+        public EntityBuilder WithDynamic(IntPtr component, EcsId componentId)
+        {
+            ptr = _entitybuilder_with_dynamic(ptr, component, componentId);
+            return this;
+        }
+
         [DllImport(Name.LibName)]
         private static extern EcsId _entitybuilder_build(IntPtr builder);
+
+        [DllImport(Name.LibName)]
+        private static extern IntPtr _entitybuilder_with_dynamic(IntPtr builder, IntPtr component, EcsId componentId);
     }
 
     public class ComponentMeta
@@ -140,7 +150,7 @@ namespace ArcheTapeFFI
 
         private ComponentMeta(IntPtr ptr)
         {
-            this.Ptr = ptr;
+            Ptr = ptr;
         }
 
         public static ComponentMeta FromSizeAlign(nuint size, nuint align)
@@ -160,6 +170,74 @@ namespace ArcheTapeFFI
         private static extern IntPtr _component_meta_unit();
     }
 
+    public class DynQuery : IEnumerable
+    {
+        private FFIDynQuery query;
+        private FFIDynQueryIter? iterator;
+
+        public unsafe DynQuery(World world, FetchType[] fetches)
+        {
+            fixed (FetchType* f = fetches)
+            {
+                query = _dyn_query_new(world.Ptr, f, (nuint) fetches.Length);
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FFIDynQuery
+        {
+            private IntPtr ptr;
+            private nuint len;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FFIDynQueryIter
+        {
+            private IntPtr ptr;
+            private nuint len;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FFIDynQueryResult
+        {
+            internal IntPtr ptr;
+            internal nuint len;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct PtrLen
+        {
+            internal IntPtr ptr;
+            internal nuint len;
+        }
+
+        public IEnumerator GetEnumerator()
+        {
+            iterator ??= _dyn_query_iter(query);
+
+            while (true)
+            {
+                var next = _dyn_query_next(iterator.Value);
+                if (next.len == 0)
+                {
+                    break;
+                }
+
+                yield return Utils.MarshalToArray<PtrLen>(next.ptr, (int) next.len);
+            }
+        }
+
+        [DllImport(Name.LibName)]
+        private static extern unsafe FFIDynQuery _dyn_query_new(IntPtr world, FetchType* fetches, nuint len);
+
+        [DllImport(Name.LibName)]
+        private static extern FFIDynQueryIter _dyn_query_iter(FFIDynQuery query);
+
+        [DllImport(Name.LibName)]
+        private static extern FFIDynQueryResult _dyn_query_next(FFIDynQueryIter query);
+    }
+
+
     public static class Utils
     {
         public static IntPtr Allocate<T>(T data)
@@ -168,6 +246,61 @@ namespace ArcheTapeFFI
             Marshal.StructureToPtr(data, ptr, false);
             return ptr;
         }
+
+        public static T[] MarshalToArray<T>(IntPtr unmanagedArray, int length)
+        {
+            var size = Marshal.SizeOf(typeof(T));
+            var managedArray = new T[length];
+
+            for (var i = 0; i < length; i++)
+            {
+                var ins = new IntPtr(unmanagedArray.ToInt64() + i * size);
+                managedArray[i] = Marshal.PtrToStructure<T>(ins);
+            }
+
+            return managedArray;
+        }
+    }
+
+    public enum FetchTypeTag : byte
+    {
+        EcsId,
+        Mut,
+        Immut,
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MutFetch
+    {
+        private FetchTypeTag tag;
+        private EcsId id;
+
+        public MutFetch(EcsId id)
+        {
+            tag = FetchTypeTag.Mut;
+            this.id = id;
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ImmutFetch
+    {
+        private FetchTypeTag tag;
+        private EcsId id;
+
+        public ImmutFetch(EcsId id)
+        {
+            tag = FetchTypeTag.Immut;
+            this.id = id;
+        }
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    public struct FetchType
+    {
+        [FieldOffset(0)] public FetchTypeTag tag;
+        [FieldOffset(0)] public MutFetch mutFetch;
+        [FieldOffset(0)] public ImmutFetch immutFetch;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -188,18 +321,40 @@ namespace ArcheTapeFFI
         public static unsafe void Main(string[] args)
         {
             var world = new World();
-            var entity = world.Spawn().Build();
-            Console.WriteLine($"entity: {entity}");
 
-            var meta = ComponentMeta.FromSizeAlign(8, 4);
-            var dataId = world.SpawnWithComponentMeta(meta).Build();
-            Console.WriteLine($"data entity: {dataId}");
+            var dataId = world.SpawnWithComponentMeta(ComponentMeta.FromSizeAlign(8, 4)).Build();
+            var intId = world.SpawnWithComponentMeta(ComponentMeta.FromSizeAlign(4, 4)).Build();
 
-            var data = new StructData { f1 = 42, f2 = 10, f3 = 1337};
-            world.AddComponentDynamicWithData(entity, dataId, &data);
+            var data = new StructData {f1 = 42, f2 = 10, f3 = 1337};
+            world.Spawn().WithDynamic((IntPtr) (&data), dataId).WithDynamic(Utils.Allocate(111), intId).Build();
+            data = new StructData {f1 = 42, f2 = 10, f3 = 99999};
+            world.Spawn().WithDynamic((IntPtr) (&data), dataId).Build();
 
-            var getData = world.GetComponentDynamic(entity, dataId);
-            Console.WriteLine($"got data at: 0x{getData:X16}: {*(StructData*) getData.ToPointer()}");
+            var fetches = new[]
+                          {
+                              new FetchType
+                              {
+                                  immutFetch = new ImmutFetch(dataId)
+                              },
+                              new FetchType
+                              {
+                                  immutFetch = new ImmutFetch(intId)
+                              }
+                          };
+
+            var query = new DynQuery(world, fetches);
+            foreach (DynQuery.PtrLen[] col in query)
+            {
+                for (var i = 0; i < (int) col[0].len; ++i)
+                {
+                    Console.WriteLine(*(StructData*) (col[0].ptr + i * Marshal.SizeOf<StructData>()));
+                }
+
+                for (var i = 0; i < (int) col[1].len; ++i)
+                {
+                    Console.WriteLine(*(int*) (col[1].ptr + i * Marshal.SizeOf<int>()));
+                }
+            }
         }
     }
 }

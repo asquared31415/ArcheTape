@@ -23,7 +23,7 @@
     <ItemGroup>
         <Content Include="..\target\debug\arche_tape.dll">
             <Link>arche_tape.dll</Link>
-            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
         </Content>
     </ItemGroup>
 
